@@ -5,13 +5,11 @@ from pydantic import BaseModel
 import yt_dlp
 import uuid
 import os
-import json
-import asyncio
+import time
 from pathlib import Path
 
 app = FastAPI(title="YTVault API")
 
-# CORS — permite o app no GitHub Pages chamar esta API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,26 +19,44 @@ app.add_middleware(
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+COOKIES_FILE = Path("cookies.txt")
 
-# Estado em memória (jobs e biblioteca)
-jobs: dict = {}       # job_id → { status, progress, error, info }
-library: list = []    # lista de vídeos baixados
+jobs: dict = {}
+library: list = []
 
-
-# ── MODELOS ──────────────────────────────────────
 class DownloadRequest(BaseModel):
     url: str
-    quality: str = "1080p"   # 2160p, 1080p, 720p, 480p, audio
-    format: str = "mp4"      # mp4, webm, mkv, mp3
+    quality: str = "1080p"
+    format: str = "mp4"
 
+def get_ydl_opts(extra: dict = {}) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+            }
+        },
+        "socket_timeout": 60,
+        "retries": 10,
+        "fragment_retries": 10,
+    }
+    # Usa cookies se existir o arquivo
+    if COOKIES_FILE.exists():
+        opts["cookiefile"] = str(COOKIES_FILE)
+    opts.update(extra)
+    return opts
 
-# ── HELPERS ──────────────────────────────────────
 def quality_to_format(quality: str, fmt: str) -> str:
     if quality == "audio":
         return "bestaudio/best"
     res = quality.replace("p", "")
-    return f"bestvideo[height<={res}][ext={fmt}]+bestaudio/bestvideo[height<={res}]+bestaudio/best"
-
+    return f"bestvideo[height<={res}]+bestaudio/bestvideo[height<={res}]/best[height<={res}]/best"
 
 def progress_hook(job_id: str):
     def hook(d):
@@ -57,49 +73,28 @@ def progress_hook(job_id: str):
             jobs[job_id]["status"] = "processing"
     return hook
 
-
 def do_download(job_id: str, url: str, quality: str, fmt: str):
     try:
         output_template = str(DOWNLOAD_DIR / f"{job_id}_%(title)s.%(ext)s")
-
-        ydl_opts = {
+        extra = {
             "format": quality_to_format(quality, fmt),
             "outtmpl": output_template,
             "progress_hooks": [progress_hook(job_id)],
-            "merge_output_format": fmt if fmt != "mp3" else None,
-            "quiet": True,
-            "no_warnings": True,
-            # Anti-403: simula navegador real
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-            },
-            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
-            "socket_timeout": 30,
-            "retries": 5,
-            "fragment_retries": 5,
-            "concurrent_fragment_downloads": 4,
+            "merge_output_format": fmt if quality != "audio" else None,
         }
-
-        # Se for áudio, extrai MP3
         if quality == "audio" or fmt == "mp3":
-            ydl_opts["postprocessors"] = [{
+            extra["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }]
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(get_ydl_opts(extra)) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-
-            # Ajusta extensão se foi convertido
             if quality == "audio" or fmt == "mp3":
                 filename = Path(filename).with_suffix(".mp3").__str__()
 
-            # Salva na biblioteca
             video_entry = {
                 "id": job_id,
                 "title": info.get("title", "Sem título"),
@@ -114,7 +109,7 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
                 "tags": info.get("tags", [])[:3] if info.get("tags") else [],
                 "category": "Sem categoria",
                 "favorite": False,
-                "date": int(__import__("time").time() * 1000),
+                "date": int(time.time() * 1000),
             }
             library.append(video_entry)
             jobs[job_id]["status"] = "done"
@@ -124,7 +119,6 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
     except Exception as e:
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
-
 
 def format_duration(seconds: int) -> str:
     if not seconds:
@@ -136,93 +130,71 @@ def format_duration(seconds: int) -> str:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
-
-# ── ROTAS ────────────────────────────────────────
-
 @app.get("/")
 def root():
-    return {"status": "YTVault API online ✅"}
+    return {"status": "YTVault API online ✅", "cookies": COOKIES_FILE.exists()}
 
+@app.post("/cookies")
+async def upload_cookies(body: dict):
+    """Recebe conteúdo do arquivo cookies.txt e salva no servidor"""
+    content = body.get("content", "")
+    if not content:
+        raise HTTPException(400, "Conteúdo vazio")
+    COOKIES_FILE.write_text(content)
+    return {"saved": True, "lines": len(content.splitlines())}
+
+@app.get("/cookies/status")
+def cookies_status():
+    return {"exists": COOKIES_FILE.exists(), "lines": len(COOKIES_FILE.read_text().splitlines()) if COOKIES_FILE.exists() else 0}
 
 @app.post("/metadata")
 def get_metadata(body: dict):
-    """Busca título, thumb, duração sem baixar"""
     url = body.get("url")
     if not url:
         raise HTTPException(400, "URL obrigatória")
     try:
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-            },
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
                 "title": info.get("title"),
                 "channel": info.get("uploader"),
                 "duration": format_duration(info.get("duration", 0)),
                 "thumbnail": info.get("thumbnail"),
-                "view_count": info.get("view_count"),
-                "upload_date": info.get("upload_date"),
             }
     except Exception as e:
         raise HTTPException(400, str(e))
 
-
 @app.post("/download")
 def start_download(req: DownloadRequest, bg: BackgroundTasks):
-    """Inicia download em background e retorna job_id"""
     job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {
-        "status": "queue",
-        "progress": 0,
-        "speed": "",
-        "eta": "",
-        "error": None,
-        "info": None,
-    }
+    jobs[job_id] = {"status": "queue", "progress": 0, "speed": "", "eta": "", "error": None, "info": None}
     bg.add_task(do_download, job_id, req.url, req.quality, req.format)
     return {"job_id": job_id}
 
-
 @app.get("/progress/{job_id}")
 def get_progress(job_id: str):
-    """Retorna progresso de um download"""
     if job_id not in jobs:
         raise HTTPException(404, "Job não encontrado")
     return jobs[job_id]
 
-
 @app.get("/library")
 def get_library():
-    """Lista todos os vídeos baixados"""
     return library
-
 
 @app.delete("/library/{video_id}")
 def delete_video(video_id: str):
-    """Remove vídeo da biblioteca e do disco"""
     global library
     video = next((v for v in library if v["id"] == video_id), None)
     if not video:
         raise HTTPException(404, "Vídeo não encontrado")
-
-    # Remove arquivo do disco
     filepath = DOWNLOAD_DIR / video["filename"]
     if filepath.exists():
         filepath.unlink()
-
     library = [v for v in library if v["id"] != video_id]
     return {"deleted": video_id}
 
-
 @app.get("/download-file/{video_id}")
 def download_file(video_id: str):
-    """Faz download do arquivo para o cliente"""
     video = next((v for v in library if v["id"] == video_id), None)
     if not video:
         raise HTTPException(404, "Vídeo não encontrado")
@@ -230,3 +202,4 @@ def download_file(video_id: str):
     if not filepath.exists():
         raise HTTPException(404, "Arquivo não encontrado no disco")
     return FileResponse(filepath, filename=video["filename"])
+
