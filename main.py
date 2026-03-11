@@ -69,6 +69,18 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
             "merge_output_format": fmt if fmt != "mp3" else None,
             "quiet": True,
             "no_warnings": True,
+            # Anti-403: simula navegador real
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+            },
+            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
+            "socket_timeout": 30,
+            "retries": 5,
+            "fragment_retries": 5,
+            "concurrent_fragment_downloads": 4,
         }
 
         # Se for áudio, extrai MP3
@@ -139,7 +151,15 @@ def get_metadata(body: dict):
     if not url:
         raise HTTPException(400, "URL obrigatória")
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            },
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
                 "title": info.get("title"),
