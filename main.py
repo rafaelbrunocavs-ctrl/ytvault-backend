@@ -39,8 +39,7 @@ def get_ydl_opts(extra: dict = {}) -> dict:
         },
         "extractor_args": {
             "youtube": {
-                # android retorna lista completa de formatos mesmo de servidores
-                "player_client": ["android", "web"],
+                "player_client": ["web"],
                 "skip": ["translated_subs"],
             }
         },
