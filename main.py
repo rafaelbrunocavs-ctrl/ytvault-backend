@@ -60,13 +60,13 @@ def get_db():
 
 def fetch_all(db, query, params=()):
     db.execute(query, params)
-    cols = [desc[0] for desc in conn.description]
-    return [dict(zip(cols, row)) for row in conn.fetchall()]
+    cols = [desc[0] for desc in db.description]
+    return [dict(zip(cols, row)) for row in db.fetchall()]
 
 def fetch_one(db, query, params=()):
     db.execute(query, params)
-    cols = [desc[0] for desc in conn.description]
-    row = conn.fetchone()
+    cols = [desc[0] for desc in db.description]
+    row = db.fetchone()
     return dict(zip(cols, row)) if row else None
 
 # ─────────────────────────────────────────────
