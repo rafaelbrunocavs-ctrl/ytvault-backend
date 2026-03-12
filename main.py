@@ -35,26 +35,38 @@ else:
 def get_db():
     """Abre e fecha a conexão automaticamente, funciona igual pros dois bancos."""
     conn = get_connection()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if DATABASE_URL:
+        # psycopg2 precisa de cursor explícito
+        cur = conn.cursor()
+        try:
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+    else:
+        # sqlite3 executa direto na conexão
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
-def fetch_all(conn, query, params=()):
-    """Roda um SELECT e retorna lista de dicionários."""
-    cur = conn.execute(query, params)
-    cols = [desc[0] for desc in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+def fetch_all(db, query, params=()):
+    db.execute(query, params)
+    cols = [desc[0] for desc in conn.description]
+    return [dict(zip(cols, row)) for row in conn.fetchall()]
 
-def fetch_one(conn, query, params=()):
-    """Roda um SELECT e retorna um dicionário (ou None)."""
-    cur = conn.execute(query, params)
-    cols = [desc[0] for desc in cur.description]
-    row = cur.fetchone()
+def fetch_one(db, query, params=()):
+    db.execute(query, params)
+    cols = [desc[0] for desc in conn.description]
+    row = conn.fetchone()
     return dict(zip(cols, row)) if row else None
 
 # ─────────────────────────────────────────────
@@ -87,8 +99,8 @@ class DownloadRequest(BaseModel):
 
 def init_db():
     """Cria a tabela se não existir. Roda uma vez ao iniciar."""
-    with get_db() as conn:
-        conn.execute("""
+    with get_db() as db:
+        db.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 id        TEXT PRIMARY KEY,
                 title     TEXT,
@@ -203,8 +215,8 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
             }
 
             p = PLACEHOLDER
-            with get_db() as conn:
-                conn.execute(
+            with get_db() as db:
+                db.execute(
                     f"INSERT INTO videos (id,title,channel,duration,quality,format,size,thumb,url,filename,category,favorite,date) "
                     f"VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})",
                     list(video.values())
@@ -283,8 +295,8 @@ def get_progress(job_id: str):
 
 @app.get("/library")
 def get_library():
-    with get_db() as conn:
-        videos = fetch_all(conn, "SELECT * FROM videos ORDER BY date DESC")
+    with get_db() as db:
+        videos = fetch_all(db, "SELECT * FROM videos ORDER BY date DESC")
     for v in videos:
         v["favorite"] = bool(v.get("favorite", False))
         v["tags"] = []
@@ -293,32 +305,32 @@ def get_library():
 @app.delete("/library/{video_id}")
 def delete_video(video_id: str):
     p = PLACEHOLDER
-    with get_db() as conn:
-        video = fetch_one(conn, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
+    with get_db() as db:
+        video = fetch_one(db, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
         if not video:
             raise HTTPException(404, "Vídeo não encontrado")
         filepath = DOWNLOAD_DIR / video["filename"]
         if filepath.exists():
             filepath.unlink()
-        conn.execute(f"DELETE FROM videos WHERE id = {p}", (video_id,))
+        db.execute(f"DELETE FROM videos WHERE id = {p}", (video_id,))
     return {"deleted": video_id}
 
 @app.patch("/library/{video_id}/favorite")
 def toggle_favorite(video_id: str):
     p = PLACEHOLDER
-    with get_db() as conn:
-        video = fetch_one(conn, f"SELECT favorite FROM videos WHERE id = {p}", (video_id,))
+    with get_db() as db:
+        video = fetch_one(db, f"SELECT favorite FROM videos WHERE id = {p}", (video_id,))
         if not video:
             raise HTTPException(404, "Vídeo não encontrado")
         new_val = 0 if video["favorite"] else 1
-        conn.execute(f"UPDATE videos SET favorite = {p} WHERE id = {p}", (new_val, video_id))
+        db.execute(f"UPDATE videos SET favorite = {p} WHERE id = {p}", (new_val, video_id))
     return {"favorite": bool(new_val)}
 
 @app.get("/download-file/{video_id}")
 def download_file(video_id: str):
     p = PLACEHOLDER
-    with get_db() as conn:
-        video = fetch_one(conn, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
+    with get_db() as db:
+        video = fetch_one(db, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
     if not video:
         raise HTTPException(404, "Vídeo não encontrado")
     filepath = DOWNLOAD_DIR / video["filename"]
