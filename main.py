@@ -39,8 +39,7 @@ def get_ydl_opts(extra: dict = {}) -> dict:
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["web"],
-                "skip": ["translated_subs"],
+                "player_client": ["web", "android"],
             }
         },
         "socket_timeout": 60,
@@ -52,28 +51,11 @@ def get_ydl_opts(extra: dict = {}) -> dict:
     opts.update(extra)
     return opts
 
-def quality_to_format(quality: str, fmt: str) -> str:
+def quality_to_format(quality: str) -> str:
     if quality == "audio":
         return "bestaudio/best"
     res = quality.replace("p", "")
     return f"bestvideo[height<={res}]+bestaudio/best[height<={res}]/best"
-
-def get_available_qualities(info: dict) -> list:
-    """Extrai qualidades únicas disponíveis do vídeo"""
-    formats = info.get("formats", [])
-    heights = set()
-    for f in formats:
-        h = f.get("height")
-        if h and f.get("vcodec") != "none":
-            heights.add(h)
-    # Ordena do maior pro menor e mapeia para labels
-    labels_map = {2160: "4K · 2160p", 1440: "2K · 1440p", 1080: "Full HD · 1080p",
-                  720: "HD · 720p", 480: "SD · 480p", 360: "360p", 240: "240p", 144: "144p"}
-    result = []
-    for h in sorted(heights, reverse=True):
-        label = labels_map.get(h, f"{h}p")
-        result.append({"height": h, "label": label, "value": f"{h}p"})
-    return result
 
 def progress_hook(job_id: str):
     def hook(d):
@@ -90,16 +72,26 @@ def progress_hook(job_id: str):
             jobs[job_id]["status"] = "processing"
     return hook
 
+def format_duration(seconds: int) -> str:
+    if not seconds:
+        return "0:00"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
 def do_download(job_id: str, url: str, quality: str, fmt: str):
     try:
         output_template = str(DOWNLOAD_DIR / f"{job_id}_%(title)s.%(ext)s")
         extra = {
-            "format": quality_to_format(quality, fmt),
+            "format": quality_to_format(quality),
             "outtmpl": output_template,
             "progress_hooks": [progress_hook(job_id)],
-            "merge_output_format": fmt if quality != "audio" else None,
+            "merge_output_format": "mp4",
         }
-        if quality == "audio" or fmt == "mp3":
+        if quality == "audio":
             extra["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -109,8 +101,11 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
         with yt_dlp.YoutubeDL(get_ydl_opts(extra)) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            if quality == "audio" or fmt == "mp3":
-                filename = Path(filename).with_suffix(".mp3").__str__()
+            if not os.path.exists(filename):
+                for f in DOWNLOAD_DIR.iterdir():
+                    if f.name.startswith(job_id) and f.suffix in [".mp4", ".mkv", ".webm", ".mp3"]:
+                        filename = str(f)
+                        break
 
             video_entry = {
                 "id": job_id,
@@ -118,12 +113,12 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
                 "channel": info.get("uploader", "Desconhecido"),
                 "duration": format_duration(info.get("duration", 0)),
                 "quality": quality,
-                "format": "mp3" if quality == "audio" else fmt,
+                "format": "mp3" if quality == "audio" else "mp4",
                 "size": round(os.path.getsize(filename) / (1024**3), 2) if os.path.exists(filename) else 0,
                 "thumb": info.get("thumbnail", ""),
                 "url": url,
                 "filename": os.path.basename(filename),
-                "tags": info.get("tags", [])[:3] if info.get("tags") else [],
+                "tags": [],
                 "category": "Sem categoria",
                 "favorite": False,
                 "date": int(time.time() * 1000),
@@ -137,26 +132,13 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
 
-def format_duration(seconds: int) -> str:
-    if not seconds:
-        return "0:00"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
 @app.get("/")
 def root():
     return {"status": "YTVault API online ✅", "cookies": COOKIES_FILE.exists()}
 
 @app.get("/storage")
 def get_storage():
-    """Retorna espaço usado pelos downloads"""
-    total_bytes = sum(
-        f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file()
-    ) if DOWNLOAD_DIR.exists() else 0
+    total_bytes = sum(f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file()) if DOWNLOAD_DIR.exists() else 0
     return {
         "used_bytes": total_bytes,
         "used_gb": round(total_bytes / (1024**3), 2),
@@ -165,7 +147,6 @@ def get_storage():
 
 @app.post("/cookies")
 async def upload_cookies(body: dict):
-    """Recebe conteúdo do arquivo cookies.txt e salva no servidor"""
     content = body.get("content", "")
     if not content:
         raise HTTPException(400, "Conteúdo vazio")
@@ -176,36 +157,7 @@ async def upload_cookies(body: dict):
 def cookies_status():
     return {"exists": COOKIES_FILE.exists(), "lines": len(COOKIES_FILE.read_text().splitlines()) if COOKIES_FILE.exists() else 0}
 
-@app.post("/debug-formats")
-def debug_formats(body: dict):
-    """Debug: lista todos os formatos disponíveis para um vídeo"""
-    url = body.get("url")
-    if not url:
-        raise HTTPException(400, "URL obrigatória")
-    try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = info.get("formats", [])
-            return {
-                "total_formats": len(formats),
-                "formats": [
-                    {
-                        "format_id": f.get("format_id"),
-                        "ext": f.get("ext"),
-                        "height": f.get("height"),
-                        "width": f.get("width"),
-                        "vcodec": f.get("vcodec"),
-                        "acodec": f.get("acodec"),
-                        "filesize": f.get("filesize"),
-                        "format_note": f.get("format_note"),
-                    }
-                    for f in formats
-                ]
-            }
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-
+@app.post("/metadata")
 def get_metadata(body: dict):
     url = body.get("url")
     if not url:
@@ -213,13 +165,11 @@ def get_metadata(body: dict):
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
-            qualities = get_available_qualities(info)
             return {
                 "title": info.get("title"),
                 "channel": info.get("uploader"),
                 "duration": format_duration(info.get("duration", 0)),
                 "thumbnail": info.get("thumbnail"),
-                "qualities": qualities,
             }
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -262,4 +212,3 @@ def download_file(video_id: str):
     if not filepath.exists():
         raise HTTPException(404, "Arquivo não encontrado no disco")
     return FileResponse(filepath, filename=video["filename"])
-
