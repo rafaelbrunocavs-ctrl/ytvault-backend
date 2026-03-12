@@ -6,9 +6,60 @@ import yt_dlp
 import uuid
 import os
 import time
-import sqlite3                  # <- banco de dados, já vem no Python
 from pathlib import Path
 from contextlib import contextmanager
+
+# ─────────────────────────────────────────────
+# BANCO: SQLite (local) ou PostgreSQL (Railway)
+# ─────────────────────────────────────────────
+# Railway injeta DATABASE_URL automaticamente quando você adiciona
+# um PostgreSQL ao projeto. Sem ela, usa SQLite como fallback.
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    import psycopg2
+    PLACEHOLDER = "%s"
+    def get_connection():
+        return psycopg2.connect(DATABASE_URL)
+else:
+    import sqlite3
+    DB_FILE = Path("ytvault.db")
+    PLACEHOLDER = "?"
+    def get_connection():
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+@contextmanager
+def get_db():
+    """Abre e fecha a conexão automaticamente, funciona igual pros dois bancos."""
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def fetch_all(conn, query, params=()):
+    """Roda um SELECT e retorna lista de dicionários."""
+    cur = conn.execute(query, params)
+    cols = [desc[0] for desc in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def fetch_one(conn, query, params=()):
+    """Roda um SELECT e retorna um dicionário (ou None)."""
+    cur = conn.execute(query, params)
+    cols = [desc[0] for desc in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+# ─────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────
 
 app = FastAPI(title="YTVault API")
 
@@ -22,19 +73,22 @@ app.add_middleware(
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 COOKIES_FILE = Path("cookies.txt")
-DB_FILE = Path("ytvault.db")    # <- arquivo do banco
 
 jobs: dict = {}
 
+class DownloadRequest(BaseModel):
+    url: str
+    quality: str = "1080p"
+    format: str = "mp4"
+
 # ─────────────────────────────────────────────
-# BANCO DE DADOS
+# INICIALIZAÇÃO DO BANCO
 # ─────────────────────────────────────────────
 
 def init_db():
-    """Cria as tabelas se ainda não existirem.
-    Roda uma vez quando o servidor inicia."""
-    with get_db() as db:
-        db.execute("""
+    """Cria a tabela se não existir. Roda uma vez ao iniciar."""
+    with get_db() as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 id        TEXT PRIMARY KEY,
                 title     TEXT,
@@ -48,33 +102,9 @@ def init_db():
                 filename  TEXT,
                 category  TEXT DEFAULT 'Sem categoria',
                 favorite  INTEGER DEFAULT 0,
-                date      INTEGER
+                date      BIGINT
             )
         """)
-        # Cada linha aqui é uma coluna da tabela
-        # INTEGER = número inteiro, TEXT = texto, REAL = decimal
-
-@contextmanager
-def get_db():
-    """Abre e fecha a conexão com o banco automaticamente.
-    O 'with get_db() as db' garante que sempre fecha, mesmo com erro."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row   # faz as linhas se comportarem como dicionários
-    try:
-        yield conn
-        conn.commit()                # salva as mudanças
-    except Exception:
-        conn.rollback()              # desfaz se der erro
-        raise
-    finally:
-        conn.close()
-
-def row_to_dict(row) -> dict:
-    """Converte uma linha do banco para dicionário Python."""
-    d = dict(row)
-    d["favorite"] = bool(d["favorite"])   # converte 0/1 para True/False
-    d["tags"] = []
-    return d
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -88,11 +118,7 @@ def get_ydl_opts(extra: dict = {}) -> dict:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android"],
-            }
-        },
+        "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
         "socket_timeout": 60,
         "retries": 10,
         "fragment_retries": 10,
@@ -129,9 +155,7 @@ def format_duration(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 # ─────────────────────────────────────────────
 # DOWNLOAD (roda em background)
@@ -174,24 +198,21 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
                 "url": url,
                 "filename": os.path.basename(filename),
                 "category": "Sem categoria",
-                "favorite": False,
+                "favorite": 0,
                 "date": int(time.time() * 1000),
             }
 
-            # ── SALVA NO BANCO ──────────────────────────────
-            # Antes era só: library.append(video)
-            # Agora persiste para sempre no arquivo ytvault.db
-            with get_db() as db:
-                db.execute("""
-                    INSERT OR REPLACE INTO videos
-                    (id, title, channel, duration, quality, format, size, thumb, url, filename, category, favorite, date)
-                    VALUES (:id, :title, :channel, :duration, :quality, :format, :size, :thumb, :url, :filename, :category, :favorite, :date)
-                """, {**video, "favorite": 1 if video["favorite"] else 0})
-            # ────────────────────────────────────────────────
+            p = PLACEHOLDER
+            with get_db() as conn:
+                conn.execute(
+                    f"INSERT INTO videos (id,title,channel,duration,quality,format,size,thumb,url,filename,category,favorite,date) "
+                    f"VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})",
+                    list(video.values())
+                )
 
             jobs[job_id]["status"] = "done"
             jobs[job_id]["progress"] = 100
-            jobs[job_id]["info"] = {**video, "tags": []}
+            jobs[job_id]["info"] = {**video, "favorite": False, "tags": []}
 
     except Exception as e:
         jobs[job_id]["status"] = "error"
@@ -203,20 +224,20 @@ def do_download(job_id: str, url: str, quality: str, fmt: str):
 
 @app.on_event("startup")
 def startup():
-    init_db()   # cria tabelas ao iniciar o servidor
+    init_db()
 
 @app.get("/")
 def root():
-    return {"status": "YTVault API online ✅", "cookies": COOKIES_FILE.exists()}
+    return {
+        "status": "YTVault API online ✅",
+        "db": "postgresql" if DATABASE_URL else "sqlite",
+        "cookies": COOKIES_FILE.exists()
+    }
 
 @app.get("/storage")
 def get_storage():
     total_bytes = sum(f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file()) if DOWNLOAD_DIR.exists() else 0
-    return {
-        "used_bytes": total_bytes,
-        "used_gb": round(total_bytes / (1024**3), 2),
-        "file_count": len(list(DOWNLOAD_DIR.iterdir())) if DOWNLOAD_DIR.exists() else 0
-    }
+    return {"used_bytes": total_bytes, "used_gb": round(total_bytes / (1024**3), 2)}
 
 @app.post("/cookies")
 async def upload_cookies(body: dict):
@@ -224,11 +245,11 @@ async def upload_cookies(body: dict):
     if not content:
         raise HTTPException(400, "Conteúdo vazio")
     COOKIES_FILE.write_text(content)
-    return {"saved": True, "lines": len(content.splitlines())}
+    return {"saved": True}
 
 @app.get("/cookies/status")
 def cookies_status():
-    return {"exists": COOKIES_FILE.exists(), "lines": len(COOKIES_FILE.read_text().splitlines()) if COOKIES_FILE.exists() else 0}
+    return {"exists": COOKIES_FILE.exists()}
 
 @app.post("/metadata")
 def get_metadata(body: dict):
@@ -262,45 +283,44 @@ def get_progress(job_id: str):
 
 @app.get("/library")
 def get_library():
-    # ── LÊ DO BANCO ────────────────────────────────────
-    # Antes era só: return library
-    # Agora busca todos os vídeos salvos no banco
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM videos ORDER BY date DESC").fetchall()
-    return [row_to_dict(r) for r in rows]
-    # ────────────────────────────────────────────────────
+    with get_db() as conn:
+        videos = fetch_all(conn, "SELECT * FROM videos ORDER BY date DESC")
+    for v in videos:
+        v["favorite"] = bool(v.get("favorite", False))
+        v["tags"] = []
+    return videos
 
 @app.delete("/library/{video_id}")
 def delete_video(video_id: str):
-    with get_db() as db:
-        row = db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
-        if not row:
+    p = PLACEHOLDER
+    with get_db() as conn:
+        video = fetch_one(conn, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
+        if not video:
             raise HTTPException(404, "Vídeo não encontrado")
-        video = dict(row)
         filepath = DOWNLOAD_DIR / video["filename"]
         if filepath.exists():
-            filepath.unlink()                                      # apaga o arquivo
-        db.execute("DELETE FROM videos WHERE id = ?", (video_id,))  # apaga do banco
+            filepath.unlink()
+        conn.execute(f"DELETE FROM videos WHERE id = {p}", (video_id,))
     return {"deleted": video_id}
 
 @app.patch("/library/{video_id}/favorite")
 def toggle_favorite(video_id: str):
-    """Alterna favorito — exemplo de UPDATE no banco"""
-    with get_db() as db:
-        row = db.execute("SELECT favorite FROM videos WHERE id = ?", (video_id,)).fetchone()
-        if not row:
+    p = PLACEHOLDER
+    with get_db() as conn:
+        video = fetch_one(conn, f"SELECT favorite FROM videos WHERE id = {p}", (video_id,))
+        if not video:
             raise HTTPException(404, "Vídeo não encontrado")
-        new_val = 0 if row["favorite"] else 1
-        db.execute("UPDATE videos SET favorite = ? WHERE id = ?", (new_val, video_id))
+        new_val = 0 if video["favorite"] else 1
+        conn.execute(f"UPDATE videos SET favorite = {p} WHERE id = {p}", (new_val, video_id))
     return {"favorite": bool(new_val)}
 
 @app.get("/download-file/{video_id}")
 def download_file(video_id: str):
-    with get_db() as db:
-        row = db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
-    if not row:
+    p = PLACEHOLDER
+    with get_db() as conn:
+        video = fetch_one(conn, f"SELECT * FROM videos WHERE id = {p}", (video_id,))
+    if not video:
         raise HTTPException(404, "Vídeo não encontrado")
-    video = dict(row)
     filepath = DOWNLOAD_DIR / video["filename"]
     if not filepath.exists():
         raise HTTPException(404, "Arquivo não encontrado no disco")
