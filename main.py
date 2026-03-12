@@ -39,14 +39,15 @@ def get_ydl_opts(extra: dict = {}) -> dict:
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android"],
+                # android retorna lista completa de formatos mesmo de servidores
+                "player_client": ["android", "web"],
+                "skip": ["translated_subs"],
             }
         },
         "socket_timeout": 60,
         "retries": 10,
         "fragment_retries": 10,
     }
-    # Usa cookies se existir o arquivo
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
     opts.update(extra)
@@ -183,7 +184,36 @@ async def upload_cookies(body: dict):
 def cookies_status():
     return {"exists": COOKIES_FILE.exists(), "lines": len(COOKIES_FILE.read_text().splitlines()) if COOKIES_FILE.exists() else 0}
 
-@app.post("/metadata")
+@app.post("/debug-formats")
+def debug_formats(body: dict):
+    """Debug: lista todos os formatos disponíveis para um vídeo"""
+    url = body.get("url")
+    if not url:
+        raise HTTPException(400, "URL obrigatória")
+    try:
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [])
+            return {
+                "total_formats": len(formats),
+                "formats": [
+                    {
+                        "format_id": f.get("format_id"),
+                        "ext": f.get("ext"),
+                        "height": f.get("height"),
+                        "width": f.get("width"),
+                        "vcodec": f.get("vcodec"),
+                        "acodec": f.get("acodec"),
+                        "filesize": f.get("filesize"),
+                        "format_note": f.get("format_note"),
+                    }
+                    for f in formats
+                ]
+            }
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
 def get_metadata(body: dict):
     url = body.get("url")
     if not url:
