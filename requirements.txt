@@ -1,4 +1,5 @@
-fastapi==0.111.0
-uvicorn==0.30.1
+fastapi
+uvicorn
 yt-dlp
-python-multipart==0.0.9
+python-multipart
+psycopg2-binary
