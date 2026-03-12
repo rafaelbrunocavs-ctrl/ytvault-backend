@@ -54,16 +54,9 @@ def get_ydl_opts(extra: dict = {}) -> dict:
 
 def quality_to_format(quality: str, fmt: str) -> str:
     if quality == "audio":
-        return "bestaudio[ext=m4a]/bestaudio/best"
+        return "bestaudio/best"
     res = quality.replace("p", "")
-    # Formato robusto: tenta pegar exatamente a resolução pedida com merge, senão melhor disponível até aquela res
-    return (
-        f"bestvideo[height={res}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height={res}]+bestaudio/"
-        f"bestvideo[height<={res}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={res}]+bestaudio/"
-        f"best[height<={res}]/best"
-    )
+    return f"bestvideo[height<={res}]+bestaudio/best[height<={res}]/best"
 
 def get_available_qualities(info: dict) -> list:
     """Extrai qualidades únicas disponíveis do vídeo"""
