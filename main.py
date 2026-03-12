@@ -54,9 +54,33 @@ def get_ydl_opts(extra: dict = {}) -> dict:
 
 def quality_to_format(quality: str, fmt: str) -> str:
     if quality == "audio":
-        return "bestaudio/best"
+        return "bestaudio[ext=m4a]/bestaudio/best"
     res = quality.replace("p", "")
-    return f"bestvideo[height<={res}]+bestaudio/bestvideo[height<={res}]/best[height<={res}]/best"
+    # Formato robusto: tenta pegar exatamente a resolução pedida com merge, senão melhor disponível até aquela res
+    return (
+        f"bestvideo[height={res}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height={res}]+bestaudio/"
+        f"bestvideo[height<={res}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={res}]+bestaudio/"
+        f"best[height<={res}]/best"
+    )
+
+def get_available_qualities(info: dict) -> list:
+    """Extrai qualidades únicas disponíveis do vídeo"""
+    formats = info.get("formats", [])
+    heights = set()
+    for f in formats:
+        h = f.get("height")
+        if h and f.get("vcodec") != "none":
+            heights.add(h)
+    # Ordena do maior pro menor e mapeia para labels
+    labels_map = {2160: "4K · 2160p", 1440: "2K · 1440p", 1080: "Full HD · 1080p",
+                  720: "HD · 720p", 480: "SD · 480p", 360: "360p", 240: "240p", 144: "144p"}
+    result = []
+    for h in sorted(heights, reverse=True):
+        label = labels_map.get(h, f"{h}p")
+        result.append({"height": h, "label": label, "value": f"{h}p"})
+    return result
 
 def progress_hook(job_id: str):
     def hook(d):
@@ -134,6 +158,18 @@ def format_duration(seconds: int) -> str:
 def root():
     return {"status": "YTVault API online ✅", "cookies": COOKIES_FILE.exists()}
 
+@app.get("/storage")
+def get_storage():
+    """Retorna espaço usado pelos downloads"""
+    total_bytes = sum(
+        f.stat().st_size for f in DOWNLOAD_DIR.iterdir() if f.is_file()
+    ) if DOWNLOAD_DIR.exists() else 0
+    return {
+        "used_bytes": total_bytes,
+        "used_gb": round(total_bytes / (1024**3), 2),
+        "file_count": len(list(DOWNLOAD_DIR.iterdir())) if DOWNLOAD_DIR.exists() else 0
+    }
+
 @app.post("/cookies")
 async def upload_cookies(body: dict):
     """Recebe conteúdo do arquivo cookies.txt e salva no servidor"""
@@ -155,11 +191,13 @@ def get_metadata(body: dict):
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
+            qualities = get_available_qualities(info)
             return {
                 "title": info.get("title"),
                 "channel": info.get("uploader"),
                 "duration": format_duration(info.get("duration", 0)),
                 "thumbnail": info.get("thumbnail"),
+                "qualities": qualities,
             }
     except Exception as e:
         raise HTTPException(400, str(e))
